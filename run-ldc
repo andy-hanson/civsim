@@ -1,0 +1,1 @@
+ldc2 --O5 app.d --of=app-ldc && ./app-ldc
