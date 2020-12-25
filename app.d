@@ -1,5 +1,6 @@
 @safe:
 
+import core.time : MonoTime;
 import std.algorithm : max, min;
 import std.algorithm.iteration : filter, sum;
 import std.algorithm.sorting : sort;
@@ -11,43 +12,110 @@ import std.random : Mt19937, uniform01;
 import std.stdio : writeln;
 
 immutable uint D = 3;
+
 void main(scope immutable string[] args) {
-	immutable Options options = parseOptions(args[1..$]); // Arg 0 is path to exe
+	// immutable Options options = parseOptions(args[1..$]); // Arg 0 is path to exe
+
+	string res = "nPoints,speedOfSpread,nCivs,medianCivOrigin,medianWaitTime\n";
+	//for (uint nPoints = 1024; nPoints <= 1_048_576; nPoints *= 2) {
+	//	for (double speedOfSpread = 1.0/32; speedOfSpread <= 0.5; speedOfSpread *= 2) {
+	immutable uint nPoints = 32768;
+	immutable double speedOfSpread = 0.03125;
+
+	Perf perf = Perf(MonoTime.currTime);
+			immutable Options options = immutable Options(nPoints, speedOfSpread, 6.0);
+			writeln(showOptions(options));
+			immutable SimResult result = runSim(perf, options);
+			immutable size_t nCivs = result.xValues.length;
+			immutable double medianCivOrigin = getMedian(result.originTimes);
+			immutable double medianWaitTime = getMedian(result.waitTimes);
+			writeWithCommas(res, [double(nPoints), speedOfSpread, nCivs, medianCivOrigin, medianWaitTime]);
+			res ~= '\n';
+	//	}
+	//}
+	writeln(res);
+}
+
+struct Perf {
+	MonoTime before;
+
+	void mark(scope immutable string name) scope {
+		immutable MonoTime now = MonoTime.currTime;
+		writeln(name, " took ", now - before);
+		before = now;
+	}
+}
+
+struct SimResult {
+	immutable double[] xValues;
+	immutable double[] yValues;
+	immutable double[] zValues;
+	immutable double[] originTimes;
+	immutable double[] waitTimes;
+	immutable double[] distanceToClosestAtOrigin;
+	immutable double[] biggestAngle;
+	immutable double[] visibleCount;
+}
+
+immutable(SimResult) runSim(scope ref Perf perf, scope ref immutable Options options) {
 	immutable double speedOfLight = 1.0;
 	immutable uint randomSeed = 1337;
 	immutable Setup setup = generateSetup(randomSeed, options.nPoints, options.speedOfSpread, options.civOriginPower);
+	perf.mark("setup");
 
 	immutable double[] waitTimes = calcWaitTimes(setup, options.speedOfSpread);
+	perf.mark("waitTimes");
 	immutable double[] distanceToClosestAtOrigin = calcDistanceToClosestAtOrigin(setup);
+	perf.mark("distanceToClosestAtOrigin");
 	immutable VisibleCivs visibleCivs = calcVisibleCivs(setup, options.speedOfSpread, speedOfLight);
+	perf.mark("visibleCivs");
+	
+	immutable SimResult res = immutable SimResult(
+		map!(double, Vec)(setup.civLocations, (scope ref immutable Vec it) =>
+			it[0]),
+		map!(double, Vec)(setup.civLocations, (scope ref immutable Vec it) =>
+			it[1]),
+		map!(double, Vec)(setup.civLocations, (scope ref immutable Vec it) =>
+			it[2]),
+		setup.civOriginTimes,
+		waitTimes,
+		distanceToClosestAtOrigin,
+		visibleCivs.biggestAngle,
+		visibleCivs.visibleCount);
+	perf.mark("runSim");
+	return res;
+}
 
-	immutable double[] xValues = map!(double, Vec)(setup.civLocations, (scope ref immutable Vec it) =>
-		it[0]);
-	immutable double[] yValues = map!(double, Vec)(setup.civLocations, (scope ref immutable Vec it) =>
-		it[1]);
-	immutable double[] zValues = map!(double, Vec)(setup.civLocations, (scope ref immutable Vec it) =>
-		it[2]);
+void printSimResult(scope ref immutable Options options, scope ref immutable SimResult result, immutable bool writeCsv) {
+	writeln("x values: ", summarize(result.xValues, [1, 10]));
+	writeln("origin times: ", summarize(result.originTimes, [1, 10]));
+	writeln("wait times: ", summarize(result.waitTimes, [1, 10]));
+	writeln("distance to closest: ", summarize(result.distanceToClosestAtOrigin, [1, 10]));
+	writeln("count visible: ", summarize(result.visibleCount, [90, 99]));
+	writeln("biggest angle: ", summarize(result.biggestAngle, [90, 99]));
 
-	writeln(showOptions(options));
-	writeln("x values: ", summarize(xValues, [1, 10]));
-	writeln("origin times: ", summarize(setup.civOriginTimes, [1, 10]));
-	writeln("wait times: ", summarize(waitTimes, [1, 10]));
-	writeln("distance to closest: ", summarize(distanceToClosestAtOrigin, [1, 10]));
-	writeln("count visible: ", summarize(visibleCivs.visibleCount, [90, 99]));
-	writeln("biggest angle: ", summarize(visibleCivs.biggestAngle, [90, 99]));
-
-	if (options.writeCsv) {
-		immutable string csv = toCsv(
-			["x", "y", "z", "origin time", "wait time", "closest", "n visible", "biggest angle"],
-			[xValues, yValues, zValues, setup.civOriginTimes, waitTimes, distanceToClosestAtOrigin, visibleCivs.visibleCount, visibleCivs.biggestAngle]);
+	if (writeCsv) {
+		scope immutable string[] columnNames = ["x", "y", "z", "origin time", "wait time", "closest", "n visible", "biggest angle"];
+		scope immutable double[][8] columns = [
+			result.xValues,
+			result.yValues,
+			result.zValues,
+			result.originTimes,
+			result.waitTimes,
+			result.distanceToClosestAtOrigin,
+			result.visibleCount,
+			result.biggestAngle,
+		];
+		immutable string csv = toCsv(columnNames, columns);
 		immutable string csvName = "results_" ~ showOptions(options) ~ ".csv";
 		write(csvName, csv);
 		writeln("Wrote to ", csvName);
 	}
+
 }
 
 immutable(string) toCsv(
-	scope immutable string[] columnNames,
+	scope ref immutable string[] columnNames,
 	scope immutable double[][] columns,
 ) {
 	assert(columnNames.length == columns.length);
@@ -63,6 +131,12 @@ immutable(string) toCsv(
 		res ~= '\n';
 	}
 	return res;
+}
+
+void writeWithCommas(scope ref string res, scope immutable double[] values) {
+	writeWithCommas!double(res, values, (scope ref immutable double it) {
+		res ~= it.to!string;
+	});
 }
 
 void writeWithCommas(T)(
@@ -93,7 +167,11 @@ immutable(string) summarize(scope ref immutable double[] values, scope immutable
 	return res;
 }
 
-immutable(double) getPercentile(scope ref immutable double[] sortedValues, uint pct) {
+immutable(double) getMedian(scope ref immutable double[] values) {
+	return getPercentile(array(sort(values.dup)), 50);
+}
+
+immutable(double) getPercentile(scope immutable double[] sortedValues, uint pct) {
 	assert(sortedValues.length > 1);
 	return sortedValues[cast(size_t) round((sortedValues.length - 1) * pct / 100.0)];
 }
@@ -202,7 +280,7 @@ struct Setup {
 	Vec[] civLocations;
 	double[] civOriginTimes;
 
-	immutable(size_t) nCivs() immutable {
+	immutable(size_t) nCivs() scope immutable {
 		return civLocations.length;
 	}
 }
@@ -277,10 +355,6 @@ double timeToSpread(ref const Vec a, ref const Vec b, immutable double speedOfSp
 alias Random = Mt19937;
 alias Vec = double[D];
 
-@trusted immutable(T[]) castImmutable(T)(T[] values) {
-	return cast(immutable) values;
-}
-
 immutable(Out[]) map(Out, In)(
 	scope ref immutable In[] values,
 	scope immutable(Out) delegate(scope ref immutable In) @safe pure nothrow cb,
@@ -327,4 +401,8 @@ immutable(double) maxOver(
 
 immutable(string) toOrdinal(immutable uint i) {
 	return i == 1 ? "1st" : (i.to!string ~ "th");
+}
+
+@trusted immutable(T[]) castImmutable(T)(T[] values) {
+	return cast(immutable) values;
 }
