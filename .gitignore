@@ -1,4 +1,4 @@
-app
+app-debug
 app-ldc
 *.o
 *.csv

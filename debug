@@ -1,0 +1,1 @@
+./build-debug && gdb app-debug

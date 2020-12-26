@@ -1,0 +1,1 @@
+dmd -debug src/*.d -of=app-debug

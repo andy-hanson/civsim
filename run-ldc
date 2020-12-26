@@ -1,1 +1,1 @@
-ldc2 --O5 app.d --of=app-ldc && ./app-ldc
+ldc2 --O5 src/*.d --of=app-ldc && ./app-ldc
