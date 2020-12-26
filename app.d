@@ -8,6 +8,7 @@ import std.array : array;
 import std.conv : to;
 import std.file : write;
 import std.math : isInfinity, pow, round, sqrt;
+import std.parallelism : TaskPool;
 import std.random : Mt19937, uniform01;
 import std.stdio : writeln;
 
@@ -17,22 +18,20 @@ void main(scope immutable string[] args) {
 	// immutable Options options = parseOptions(args[1..$]); // Arg 0 is path to exe
 
 	string res = "nPoints,speedOfSpread,nCivs,medianCivOrigin,medianWaitTime\n";
-	//for (uint nPoints = 1024; nPoints <= 1_048_576; nPoints *= 2) {
-	//	for (double speedOfSpread = 1.0/32; speedOfSpread <= 0.5; speedOfSpread *= 2) {
-	immutable uint nPoints = 32768;
+	immutable uint nPoints = 65536;
 	immutable double speedOfSpread = 0.03125;
 
+	TaskPool taskPool = new TaskPool();
 	Perf perf = Perf(MonoTime.currTime);
-			immutable Options options = immutable Options(nPoints, speedOfSpread, 6.0);
-			writeln(showOptions(options));
-			immutable SimResult result = runSim(perf, options);
-			immutable size_t nCivs = result.xValues.length;
-			immutable double medianCivOrigin = getMedian(result.originTimes);
-			immutable double medianWaitTime = getMedian(result.waitTimes);
-			writeWithCommas(res, [double(nPoints), speedOfSpread, nCivs, medianCivOrigin, medianWaitTime]);
-			res ~= '\n';
-	//	}
-	//}
+	immutable Options options = immutable Options(nPoints, speedOfSpread, 6.0);
+	writeln(showOptions(options));
+	immutable SimResult result = runSim(taskPool, perf, options);
+	immutable size_t nCivs = result.xValues.length;
+	immutable double medianCivOrigin = getMedian(result.originTimes);
+	immutable double medianWaitTime = getMedian(result.waitTimes);
+	writeWithCommas(res, [double(nPoints), speedOfSpread, nCivs, medianCivOrigin, medianWaitTime]);
+	res ~= '\n';
+	taskPool.finish();
 	writeln(res);
 }
 
@@ -57,18 +56,14 @@ struct SimResult {
 	immutable double[] visibleCount;
 }
 
-immutable(SimResult) runSim(scope ref Perf perf, scope ref immutable Options options) {
+immutable(SimResult) runSim(scope ref TaskPool taskPool, scope ref Perf perf, scope ref immutable Options options) {
 	immutable double speedOfLight = 1.0;
 	immutable uint randomSeed = 1337;
-	immutable Setup setup = generateSetup(randomSeed, options.nPoints, options.speedOfSpread, options.civOriginPower);
+	immutable Setup setup = generateSetup(taskPool, randomSeed, options.nPoints, options.speedOfSpread, options.civOriginPower);
 	perf.mark("setup");
 
-	immutable double[] waitTimes = calcWaitTimes(setup, options.speedOfSpread);
-	perf.mark("waitTimes");
-	immutable double[] distanceToClosestAtOrigin = calcDistanceToClosestAtOrigin(setup);
-	perf.mark("distanceToClosestAtOrigin");
-	immutable VisibleCivs visibleCivs = calcVisibleCivs(setup, options.speedOfSpread, speedOfLight);
-	perf.mark("visibleCivs");
+	immutable Calculated calculated = calculate(taskPool, setup, options.speedOfSpread, speedOfLight);
+	perf.mark("calculated");
 	
 	immutable SimResult res = immutable SimResult(
 		map!(double, Vec)(setup.civLocations, (scope ref immutable Vec it) =>
@@ -78,10 +73,10 @@ immutable(SimResult) runSim(scope ref Perf perf, scope ref immutable Options opt
 		map!(double, Vec)(setup.civLocations, (scope ref immutable Vec it) =>
 			it[2]),
 		setup.civOriginTimes,
-		waitTimes,
-		distanceToClosestAtOrigin,
-		visibleCivs.biggestAngle,
-		visibleCivs.visibleCount);
+		calculated.waitTimes,
+		calculated.distanceToClosestAtOrigin,
+		calculated.biggestAngle,
+		calculated.visibleCount);
 	perf.mark("runSim");
 	return res;
 }
@@ -215,63 +210,61 @@ immutable(Options) parseOptions(scope immutable string[] args) {
 	return immutable Options(nPoints, speedOfSpread, civOriginPower, writeCsv);
 }
 
-pure nothrow:
-
-immutable(double[]) calcWaitTimes(scope ref immutable Setup setup, immutable double speedOfSpread) {
-	return fillArr!double(setup.nCivs, (immutable size_t i) =>
-		minOver(setup.nCivs, (immutable size_t j) {
-			immutable double ti = setup.civOriginTimes[i];
-			immutable double tj = setup.civOriginTimes[j];
-			immutable double dt = ti - tj;
-			if (dt > 0) {
-				immutable double dist = distance(setup.civLocations[i], setup.civLocations[j]);
-				immutable double thisWaitTime = dist / speedOfSpread - dt;
-				assert(thisWaitTime > 0);
-				return thisWaitTime;
-			} else
-				return double.infinity;
-		}));
-}
-
-immutable(double[]) calcDistanceToClosestAtOrigin(scope ref immutable Setup setup) {
-	return fillArr!double(setup.nCivs, (immutable size_t i) =>
-		minOver(setup.nCivs, (immutable size_t j) =>
-			setup.civOriginTimes[j] < setup.civOriginTimes[i]
-				? distance(setup.civLocations[i], setup.civLocations[j])
-				: double.infinity));
-}
-
-struct VisibleCivs {
+struct Calculated {
+	immutable double[] waitTimes;
+	immutable double[] distanceToClosestAtOrigin;
 	immutable double[] biggestAngle;
 	immutable double[] visibleCount;
 }
-immutable(VisibleCivs) calcVisibleCivs(
+
+@trusted immutable(Calculated) calculate(
+	scope ref TaskPool taskPool,
 	scope ref immutable Setup setup,
 	immutable double speedOfSpread,
 	immutable double speedOfLight,
 ) {
-	double[] biggestAngles;
-	double[] visibleCounts;
+	double[] waitTimes = new double[setup.nCivs];
+	double[] distanceToClosestAtOrigin = new double[setup.nCivs];
+	double[] biggestAngles = new double[setup.nCivs];
+	double[] visibleCounts = new double[setup.nCivs];
 
 	assert(speedOfSpread < speedOfLight);
-	foreach (immutable size_t i; 0..setup.nCivs) {
-		uint count = 0;
-		immutable double biggest = maxOver(setup.nCivs, (immutable size_t j) {
-			if (setup.civOriginTimes[j] < setup.civOriginTimes[i]) {
-				immutable double dist = distance(setup.civLocations[i], setup.civLocations[j]);
-				immutable double firstVisibleTime = setup.civOriginTimes[j] + dist / speedOfLight;
-				immutable double dt = setup.civOriginTimes[i] - firstVisibleTime;
-				if (dt > 0) {
-					count++;
-					return speedOfSpread * dt / dist;
+
+	foreach (size_t i, immutable double ti; taskPool.parallel(setup.civOriginTimes, 64)) {
+		immutable Vec locationI = setup.civLocations[i];
+		double waitTime = double.infinity;
+		double distanceToClosest = double.infinity;
+		double biggestAngle = -double.infinity;
+		uint countVisible = 0;
+		foreach (immutable size_t j; 0..setup.nCivs) {
+			immutable double tj = setup.civOriginTimes[j];
+			immutable double dt = ti - tj;
+			if (dt > 0) {
+				immutable double dist = distance(locationI, setup.civLocations[j]);
+				immutable double thisWaitTime = dist / speedOfSpread - dt;
+				assert(thisWaitTime > 0);
+				waitTime = min(waitTime, thisWaitTime);
+				distanceToClosest = min(distanceToClosest, dist);
+
+				immutable double firstVisibleTime = tj + dist / speedOfLight;
+				immutable double visibleDt = ti - firstVisibleTime;
+				if (visibleDt > 0) {
+					countVisible++;
+					biggestAngle = max(biggestAngle, speedOfSpread * visibleDt / dist);
 				}
 			}
-			return -double.infinity;
-		});
-		biggestAngles ~= biggest;
-		visibleCounts ~= count;
+		}
+		waitTimes[i] = waitTime;
+		distanceToClosestAtOrigin[i] = distanceToClosest;
+		biggestAngles[i] = biggestAngle;
+		visibleCounts[i] = countVisible;
 	}
-	return immutable VisibleCivs(castImmutable(biggestAngles), castImmutable(visibleCounts));
+
+	return immutable Calculated(
+		castImmutable(waitTimes),
+		castImmutable(distanceToClosestAtOrigin),
+		castImmutable(biggestAngles),
+		castImmutable(visibleCounts));
 }
 
 struct Setup {
@@ -285,7 +278,8 @@ struct Setup {
 	}
 }
 
-immutable(Setup) generateSetup(
+@trusted immutable(Setup) generateSetup(
+	scope ref TaskPool taskPool,
 	immutable uint randomSeed,
 	immutable uint nPoints,
 	immutable double speedOfSpread,
@@ -299,15 +293,21 @@ immutable(Setup) generateSetup(
 		pow(r, 1.0 / (1.0 + civOriginPower)));
 	immutable double[] allOriginTimes = array(sort(allOriginTimesUnsorted.dup));
 
+	bool[] precluded = new bool[nPoints];
+	foreach (size_t i, ref immutable Vec location; taskPool.parallel(allLocations, 64))
+		precluded[i] = isPrecluded(allLocations[0..i], allOriginTimes[0..i], speedOfSpread, location, allOriginTimes[i]);
+
 	Vec[] civLocations;
 	double[] civOriginTimes;
-	foreach (immutable uint i; 0..nPoints)
-		if (!isPrecluded(allLocations[0..i], allOriginTimes[0..i], speedOfSpread, allLocations[i], allOriginTimes[i])) {
+	foreach (immutable size_t i; 0..nPoints)
+		if (!precluded[i]) {
 			civLocations ~= allLocations[i];
 			civOriginTimes ~= allOriginTimes[i];
 		}
 	return immutable Setup(castImmutable(civLocations), castImmutable(civOriginTimes));
 }
+
+pure nothrow:
 
 immutable(bool) isPrecluded(
 	scope immutable Vec[] locations,
