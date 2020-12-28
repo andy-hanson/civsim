@@ -46,7 +46,14 @@ void testTimeToReach() {
 }
 
 void testIsPrecludedBy() {
-	assert(!isPrecludedBy!3(v000, 0.1, 0.5, vMid00,1.09));
+	immutable Vec!1 a = [0.0];
+	immutable Vec!1 b = [0.5];
+	assert(!isPrecludedBy!1(a, 0.0, 0.99, b, 0.5));
+	assert(isPrecludedBy!1(a, 0.0, 1.01, b, 0.5));
+	assert(!isPrecludedBy!1(b, 0.0, 0.99, a, 0.5));
+	assert(isPrecludedBy!1(b, 0.0, 1.01, a, 0.5));
+
+	assert(!isPrecludedBy!3(v000, 0.1, 0.5, vMid00, 1.09));
 	assert(isPrecludedBy!3(v000, 0.1, 0.5, vMid00, 1.1));
 	assert(isPrecludedBy!3(v000, 0.1, 0.5, vMid00, 1.11));
 }
